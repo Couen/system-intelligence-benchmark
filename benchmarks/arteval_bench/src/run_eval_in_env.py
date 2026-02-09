@@ -249,11 +249,13 @@ async def run_eval_in_env(deployment, project_path, task_id, task, model, agent_
     )
     logger.info('Project files uploaded.')
     
-    # For claude_sdk: remove eval script dirs so the agent cannot see evaluation logic
+    # Long-running agents (claude_sdk, ae_agent): remove eval script dirs so the agent cannot see evaluation logic
     is_claude_sdk = str(agent_path).endswith('claude_sdk')
-    if is_claude_sdk:
-        logger.info('Removing _agent_eval directories for claude_sdk to prevent answer leakage...')
-        # Recursively find and remove all _agent_eval directories
+    is_ae_agent = str(agent_path).endswith('ae_agent')
+    is_long_running_agent = is_claude_sdk or is_ae_agent
+    agent_label = 'ae_agent' if is_ae_agent else 'claude_sdk'
+    if is_long_running_agent:
+        logger.info(f'Removing _agent_eval directories for {agent_label} to prevent answer leakage...')
         await runtime.run_in_session(
             BashAction(command='find /repo -type d -name "_agent_eval" -exec rm -rf {} + 2>/dev/null || true', timeout=30.0)
         )
@@ -283,8 +285,8 @@ async def run_eval_in_env(deployment, project_path, task_id, task, model, agent_
     logger.info(await runtime.run_in_session(BashAction(command='cat /agent/runner.sh')))
     logger.info(await runtime.run_in_session(BashAction(command='/agent/install.sh')))
     
-    # Set required env vars for claude_sdk (passed from host into container)
-    if is_claude_sdk:
+    # Set required env vars for long-running agents (passed from host into container)
+    if is_long_running_agent:
         anthropic_api_key = os.environ.get('ANTHROPIC_API_KEY')
         if anthropic_api_key:
             # Set env var in container bash session; use single quotes to avoid shell escaping
@@ -300,10 +302,9 @@ async def run_eval_in_env(deployment, project_path, task_id, task, model, agent_
             logger.warning('ANTHROPIC_API_KEY not found in host environment. Runner may fail.')
 
     logger.info('Running runner script...')
-    # claude_sdk: longer timeout and live log streaming (other agents unchanged)
-    runner_timeout = 172800.0 if is_claude_sdk else 1200.0  # 48h for claude_sdk
+    runner_timeout = 172800.0 if is_long_running_agent else 1200.0  # 48h for claude_sdk/ae_agent
 
-    if is_claude_sdk:
+    if is_long_running_agent:
         # Live log monitoring: run runner in background, poll log file periodically
         await runtime.run_in_session(BashAction(command='rm -f /agent/runner.live.log && touch /agent/runner.live.log', timeout=10.0))
 
@@ -330,7 +331,7 @@ async def run_eval_in_env(deployment, project_path, task_id, task, model, agent_
             )
             pid = str(getattr(ps_res, "output", "")).strip()
         
-        logger.info(f'claude_sdk runner started with pid: {pid}')
+        logger.info(f'{agent_label} runner started with pid: {pid}')
 
         await asyncio.sleep(2)  # Allow log file to have content
 
@@ -350,14 +351,14 @@ async def run_eval_in_env(deployment, project_path, task_id, task, model, agent_
                     if last_log_content and current_log_content.startswith(last_log_content):
                         new_content = current_log_content[len(last_log_content):].strip()
                         if new_content:
-                            logger.info(f'[claude_sdk live log @ {elapsed:.0f}s ({elapsed/60:.1f} min)]\n{new_content}')
+                            logger.info(f'[{agent_label} live log @ {elapsed:.0f}s ({elapsed/60:.1f} min)]\n{new_content}')
                     else:
-                        logger.info(f'[claude_sdk live log @ {elapsed:.0f}s ({elapsed/60:.1f} min)]\n{current_log_content}')
+                        logger.info(f'[{agent_label} live log @ {elapsed:.0f}s ({elapsed/60:.1f} min)]\n{current_log_content}')
                     last_log_content = current_log_content
                 elif elapsed % 300 == 0 and elapsed > 0:
-                    logger.info(f'[claude_sdk still running @ {elapsed:.0f}s ({elapsed/60:.1f} min), no new output]')
+                    logger.info(f'[{agent_label} still running @ {elapsed:.0f}s ({elapsed/60:.1f} min), no new output]')
             except Exception as e:
-                logger.info(f'Failed to read claude_sdk live log: {e}')
+                logger.info(f'Failed to read {agent_label} live log: {e}')
 
             if pid and pid.isdigit():
                 ps_res = await runtime.run_in_session(
@@ -375,7 +376,7 @@ async def run_eval_in_env(deployment, project_path, task_id, task, model, agent_
                             self.exit_code = int(code) if code.isdigit() else 0
                             self.output = f'exit_code={self.exit_code}'
                     run_results = MockResult(exit_code_str)
-                    logger.info(f'claude_sdk runner finished with exit code: {run_results.exit_code}')
+                    logger.info(f'{agent_label} runner finished with exit code: {run_results.exit_code}')
                     break
             else:
                 ps_res = await runtime.run_in_session(
@@ -383,7 +384,7 @@ async def run_eval_in_env(deployment, project_path, task_id, task, model, agent_
                 )
                 proc_count = str(getattr(ps_res, "output", "")).strip()
                 if proc_count == "0" or not proc_count.isdigit() or int(proc_count) == 0:
-                    logger.info('claude_sdk runner process not found, assuming finished')
+                    logger.info(f'{agent_label} runner process not found, assuming finished')
                     class MockResult:
                         def __init__(self):
                             self.exit_code = 0
@@ -405,10 +406,10 @@ async def run_eval_in_env(deployment, project_path, task_id, task, model, agent_
                 tail_log = await runtime.run_in_session(
                     BashAction(command='tail -n 200 /agent/runner.live.log', timeout=30.0)
                 )
-                logger.info(f'claude_sdk live log tail (on timeout):\n{tail_log}')
+                logger.info(f'{agent_label} live log tail (on timeout):\n{tail_log}')
             except Exception as e:
-                logger.info(f'Failed to read claude_sdk live log after timeout: {e}')
-            raise TimeoutError(f'claude_sdk runner exceeded timeout {runner_timeout}s')
+                logger.info(f'Failed to read {agent_label} live log after timeout: {e}')
+            raise TimeoutError(f'{agent_label} runner exceeded timeout {runner_timeout}s')
 
     else:
         runner_cmd = f'/agent/runner.sh "{model}" "{task}"'
@@ -416,9 +417,9 @@ async def run_eval_in_env(deployment, project_path, task_id, task, model, agent_
     logger.info(f"agent's run results: {run_results}")
     logger.info('Runner script finished.')
 
-    # For claude_sdk: upload eval scripts before running evaluation
-    if is_claude_sdk:
-        logger.info('Uploading _agent_eval directories for evaluation (claude_sdk)...')
+    # For long-running agents: upload eval scripts before running evaluation
+    if is_long_running_agent:
+        logger.info(f'Uploading _agent_eval directories for evaluation ({agent_label})...')
         eval_dirs = []
         for root, dirs, files in os.walk(project_path):
             if '_agent_eval' in dirs:
@@ -466,10 +467,10 @@ async def run_eval_in_env(deployment, project_path, task_id, task, model, agent_
             'status': f'error: {str(e)}',
         }
 
-    # For claude_sdk: keep container running for inspection
-    if is_claude_sdk:
+    # For long-running agents: keep container running for inspection
+    if is_long_running_agent:
         logger.info('=' * 80)
-        logger.info('Keeping Docker container running for claude_sdk (for debugging purposes).')
+        logger.info(f'Keeping Docker container running for {agent_label} (for debugging purposes).')
 
         container_id = "unknown"
         container_name = "unknown"
@@ -517,6 +518,7 @@ async def run_eval_in_env(deployment, project_path, task_id, task, model, agent_
     else:
         await deployment.stop()
         result['container_kept'] = False
+
     
     return result
 
